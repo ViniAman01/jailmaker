@@ -435,6 +435,17 @@ def passthrough_nvidia(
     # Check if the parent dir exists where we want to write our conf file
     if ld_so_conf_path.parent.exists():
         library_folders = set(str(Path(x).parent) for x in nvidia_libraries)
+        # Exclude broad system dirs that would shadow jail libc/NSS and break DNS
+        library_folders -= {
+            "/usr/lib",
+            "/usr/lib64",
+            "/lib",
+            "/lib64",
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/lib/aarch64-linux-gnu",
+        }
         # Add the library folders as mounts
         for lf in library_folders:
             nvidia_mounts.append(f"--bind-ro={lf}")
@@ -447,7 +458,10 @@ def passthrough_nvidia(
             )
 
         if library_folders != existing_conf_libraries:
-            print("\n".join(x for x in library_folders), file=ld_so_conf_path.open("w"))
+            if library_folders:
+                print("\n".join(library_folders), file=ld_so_conf_path.open("w"))
+            else:
+                ld_so_conf_path.unlink(missing_ok=True)
 
             # Run ldconfig inside systemd-nspawn jail with nvidia mounts...
             subprocess.run(
@@ -471,6 +485,70 @@ def passthrough_nvidia(
         )
 
     systemd_nspawn_additional_args += nvidia_mounts
+
+    nvidia_ctk = os.path.join(jail_rootfs_path, "usr/bin/nvidia-ctk")
+    if not os.path.exists(nvidia_ctk):
+        print(
+            f"{YELLOW}WARNING: NVIDIA Container Toolkit not installed in jail '{jail_name}'{NORMAL}"
+        )
+        print(f"To fix, run: {COMMAND_NAME} setup {jail_name}")
+
+
+def setup_jail(jail_name):
+    jail_path = get_jail_path(jail_name)
+    jail_config_path = get_jail_config_path(jail_path)
+
+    if not os.path.exists(jail_config_path):
+        eprint(f"Jail '{jail_name}' does not exist.")
+        return 1
+
+    config = KeyValueParser()
+    if jail_config_path not in config.read(jail_config_path):
+        eprint(f"Failed to read config for jail '{jail_name}'.")
+        return 1
+
+    initial_setup = config.my_get("initial_setup")
+    if not initial_setup:
+        print(f"No initial_setup script found in config for jail '{jail_name}'.")
+        return 0
+
+    jail_rootfs_path = get_jail_rootfs_path(jail_name)
+
+    if not initial_setup.startswith("#!"):
+        initial_setup = "#!/bin/sh\n" + initial_setup
+
+    with tempfile.NamedTemporaryFile(
+        mode="w+t", prefix="jlmkr-setup.", dir=jail_rootfs_path, delete=False
+    ) as f:
+        f.write(initial_setup)
+
+    setup_file = os.path.basename(f.name)
+    setup_path = os.path.abspath(f.name)
+    stat_chmod(setup_path, 0o700)
+
+    print(f"Running /{setup_file} in jail '{jail_name}'...")
+
+    returncode = exec_jail(
+        jail_name,
+        [
+            "--",
+            "systemd-run",
+            f"--unit={setup_file}",
+            "--quiet",
+            "--pipe",
+            "--wait",
+            "--service-type=exec",
+            "--property=After=network-online.target",
+            "--property=Wants=network-online.target",
+            "/" + setup_file,
+        ],
+    )
+
+    if returncode != 0:
+        eprint(f"Setup failed. You may manually run /{setup_file} inside the jail.")
+
+    Path(setup_path).unlink(missing_ok=True)
+    return returncode
 
 
 def exec_jail(jail_name, cmd):
@@ -1874,6 +1952,11 @@ def main():
             func=restart_jail,
         ),
         dict(
+            name="setup",
+            help="run initial setup in existing jail",
+            func=setup_jail,
+        ),
+        dict(
             name="shell",
             help="open shell in running jail (alias for machinectl shell)",
             func=shell_jail,
@@ -1902,7 +1985,17 @@ def main():
     ]:
         commands[d["name"]] = add_parser(subparsers, **d)
 
-    for cmd in ["edit", "exec", "log", "remove", "restart", "start", "status", "stop"]:
+    for cmd in [
+        "edit",
+        "exec",
+        "log",
+        "remove",
+        "restart",
+        "setup",
+        "start",
+        "status",
+        "stop",
+    ]:
         commands[cmd].add_argument("jail_name", help="name of the jail")
 
     commands["exec"].add_argument(
